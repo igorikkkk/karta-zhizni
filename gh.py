@@ -97,9 +97,9 @@ def access_token():
 
 def get(path, **params):
     url = f"{API}/{path}" + ("?" + urllib.parse.urlencode(params) if params else "")
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + access_token()})
     try:
-        return json.load(urllib.request.urlopen(req))
+        return with_retry(lambda: json.load(urllib.request.urlopen(
+            urllib.request.Request(url, headers={"Authorization": "Bearer " + access_token()}))))
     except urllib.error.HTTPError as e:
         return {"error": e.code, "body": e.read().decode()[:500]}
 
@@ -117,10 +117,26 @@ def probe():
     print("Сырые ответы:", path)
 
 
+def with_retry(fn, tries=4):
+    """Retry Google 5xx / network errors with backoff: 3, 9, 27 s."""
+    for i in range(tries):
+        try:
+            return fn()
+        except urllib.error.HTTPError as e:
+            if e.code < 500 or i == tries - 1:
+                raise
+        except urllib.error.URLError:
+            if i == tries - 1:
+                raise
+        time.sleep(3 ** (i + 1))
+
+
 def post(path, body):
-    req = urllib.request.Request(f"{API}/{path}", json.dumps(body).encode(), headers={
-        "Authorization": "Bearer " + access_token(), "Content-Type": "application/json"})
-    return json.load(urllib.request.urlopen(req))
+    def go():
+        req = urllib.request.Request(f"{API}/{path}", json.dumps(body).encode(), headers={
+            "Authorization": "Bearer " + access_token(), "Content-Type": "application/json"})
+        return json.load(urllib.request.urlopen(req))
+    return with_retry(go)
 
 
 def list_all(t, flt):
@@ -157,7 +173,18 @@ def sync(days=14):
     D = {}
     day = lambda k: D.setdefault(k, {})
 
+    skipped = []
+
+    def safe(name, fn):
+        try:
+            fn()
+        except Exception as e:  # one broken type must not lose the rest
+            skipped.append(f"{name}: {getattr(e, 'code', '')} {e}"[:120])
+
     def roll(t, fn):
+        safe(t, lambda: _roll(t, fn))
+
+    def _roll(t, fn):
         s = start  # heart-rate allows 14 days per request
         while s < end:
             e = min(s + timedelta(days=14), end)
@@ -174,19 +201,26 @@ def sync(days=14):
     roll("heart-rate", lambda d, p: d.update(hr={
         "avg": round(p["heartRate"]["beatsPerMinuteAvg"]), "min": p["heartRate"]["beatsPerMinuteMin"], "max": p["heartRate"]["beatsPerMinuteMax"]}))
 
+    def L(t, flt):
+        try:
+            return list_all(t, flt)
+        except Exception as e:
+            skipped.append(f"{t}: {e}"[:120])
+            return []
+
     since = start.isoformat()
-    for p in list_all("daily-resting-heart-rate", f'daily_resting_heart_rate.date >= "{since}"'):
+    for p in L("daily-resting-heart-rate", f'daily_resting_heart_rate.date >= "{since}"'):
         x = p["dailyRestingHeartRate"]; day(ymd(x["date"]))["rhr"] = int(x["beatsPerMinute"])
-    for p in list_all("daily-heart-rate-variability", f'daily_heart_rate_variability.date >= "{since}"'):
+    for p in L("daily-heart-rate-variability", f'daily_heart_rate_variability.date >= "{since}"'):
         x = p["dailyHeartRateVariability"]; day(ymd(x["date"]))["hrv"] = round(x["averageHeartRateVariabilityMilliseconds"], 1)
-    for p in list_all("daily-oxygen-saturation", f'daily_oxygen_saturation.date >= "{since}"'):
+    for p in L("daily-oxygen-saturation", f'daily_oxygen_saturation.date >= "{since}"'):
         x = p["dailyOxygenSaturation"]; day(ymd(x["date"]))["spo2"] = {
             "avg": x["averagePercentage"], "lo": x.get("lowerBoundPercentage"), "hi": x.get("upperBoundPercentage")}
-    for p in list_all("daily-respiratory-rate", f'daily_respiratory_rate.date >= "{since}"'):
+    for p in L("daily-respiratory-rate", f'daily_respiratory_rate.date >= "{since}"'):
         x = p["dailyRespiratoryRate"]; day(ymd(x["date"]))["resp"] = x["breathsPerMinute"]
 
     # Sleep is filed under the morning you woke up. Naps add to the total but the main sleep drives the chart.
-    for p in list_all("sleep", f'sleep.interval.end_time >= "{since}T00:00:00Z"'):
+    for p in L("sleep", f'sleep.interval.end_time >= "{since}T00:00:00Z"'):
         s, iv = p["sleep"], p["sleep"]["interval"]
         a, b = local(iv["startTime"], iv["startUtcOffset"]), local(iv["endTime"], iv["endUtcOffset"])
         sm = s.get("summary", {})
@@ -202,7 +236,7 @@ def sync(days=14):
         else:
             d["nap"] = d.get("nap", 0) + rec["asleep"]
 
-    for p in list_all("exercise", f'exercise.interval.civil_start_time >= "{since}T00:00:00"'):
+    for p in L("exercise", f'exercise.interval.civil_start_time >= "{since}T00:00:00"'):
         e, iv = p["exercise"], p["exercise"]["interval"]
         a = local(iv["startTime"], iv["startUtcOffset"]); m = e.get("metricsSummary", {})
         day(a.date().isoformat()).setdefault("ex", []).append({
@@ -216,6 +250,8 @@ def sync(days=14):
     from datetime import datetime
     out = {"updated": datetime.now().strftime("%Y-%m-%dT%H:%M"), "device": "Fitbit Air",
            "days": {k: D[k] for k in sorted(D) if D[k]}}
+    if skipped:  # shown on the site as a warning
+        out["warn"] = "Не все данные пришли: " + "; ".join(skipped)
     path = os.path.join(DIR, "health.json")
     with open(path, "w") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
@@ -224,7 +260,7 @@ def sync(days=14):
         with open(os.path.join(od, k + ".json"), "w") as f:
             json.dump(v, f, ensure_ascii=False)
     with open(os.path.join(od, "meta.json"), "w") as f:
-        json.dump({"updated": out["updated"], "device": out["device"]}, f)
+        json.dump({k: out[k] for k in ("updated", "device", "warn") if k in out}, f, ensure_ascii=False)
     print(f"{len(out['days'])} дн. -> {path}, файлы для базы в {od}")
     return out
 
