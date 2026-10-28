@@ -15,6 +15,17 @@ def get(url):
     with urllib.request.urlopen(url, timeout=30) as r:
         return json.load(r)
 
+# Weight by where each model's grid cell sits: DWD faces the beach, NOAA is offshore to the SE,
+# ECMWF and Météo-France sit north of the Son Tra peninsula, which shelters the beach from north swell.
+WEIGHT = {"DWD": 1.0, "NOAA": 0.8, "ECMWF": 0.4, "Météo-France": 0.4}
+NORTH = {"ECMWF", "Météo-France"}
+
+def wavg(per, idx, direction):
+    north = direction is not None and (direction < 40 or direction > 330)
+    pairs = [(WEIGHT[p[0]] * (0.5 if north and p[0] in NORTH else 1), p[idx]) for p in per if p[idx] is not None]
+    total = sum(w for w, _ in pairs)
+    return round(sum(w * v for w, v in pairs) / total, 2) if total else None
+
 def med(xs):
     xs = [x for x in xs if x is not None]
     return round(statistics.median(xs), 2) if xs else None
@@ -37,9 +48,9 @@ def main(out):
         per = [[name, col("wave_height", m), col("wave_period", m)] for m, name in MODELS]
         j, s = wi.get(t), si.get(t)
         w = lambda k: W[k][j] if j is not None else None
+        direction = med(col("wave_direction", m) for m, _ in MODELS)
         hours.append({
-            "t": t, "h": med(p[1] for p in per), "p": med(p[2] for p in per),
-            "dir": med(col("wave_direction", m) for m, _ in MODELS),
+            "t": t, "h": wavg(per, 1, direction), "p": wavg(per, 2, direction), "dir": direction,
             "swell": med(col("swell_wave_height", m) for m, _ in MODELS), "swellP": med(col("swell_wave_period", m) for m, _ in MODELS),
             "per": per, "w": w("wind_speed_10m"), "wd": w("wind_direction_10m"), "gust": w("wind_gusts_10m"),
             "rain": w("precipitation"), "storm": (w("weather_code") or 0) >= 95, "uv": w("uv_index"), "air": w("temperature_2m"),
