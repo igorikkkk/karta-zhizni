@@ -1,8 +1,8 @@
 name: surf
 on:
   schedule:
-    # 06:17-16:17 Вьетнам (UTC+7) = 23:17-09:17 UTC, каждый час
-    - cron: '17 23,0-9 * * *'
+    # каждый час круглосуточно (чтобы прогноз на завтра и дальше был свежим)
+    - cron: '17 * * * *'
   workflow_dispatch:
 permissions:
   contents: write
