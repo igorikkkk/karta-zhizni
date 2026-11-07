@@ -4,12 +4,13 @@ The «Карта жизни» page cannot fetch other sites itself (artifact CSP
 runs in GitHub Actions every hour; a Claude cloud routine copies the file into
 the page's database. Output: {at, hours:[...], sun:{date:{rise,set}}}.
 """
-import json, statistics, sys, urllib.request
+import json, os, statistics, sys, urllib.request
 from datetime import datetime, timezone, timedelta
 
 LAT, LON = 16.035, 108.25
 MODELS = [("ecmwf_wam025", "ECMWF"), ("meteofrance_wave", "Météo-France"), ("ncep_gfswave016", "NOAA"), ("gwam", "DWD")]
-BASE = f"latitude={LAT}&longitude={LON}&forecast_days=7&timezone=Asia%2FHo_Chi_Minh"
+# past_days: уже прошедшие часы нужны дневнику (запись задним числом сравнивается с реальными условиями)
+BASE = f"latitude={LAT}&longitude={LON}&past_days={os.environ.get('PAST', 2)}&forecast_days=7&timezone=Asia%2FHo_Chi_Minh"
 
 def get(url):
     with urllib.request.urlopen(url, timeout=30) as r:
